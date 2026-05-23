@@ -1,0 +1,145 @@
+{
+  "screener_name": "ETF低估筛选器",
+  "screener_version": "2.1",
+  "description": "过渡版：停用伪分位，真实观察池仅看PE/PB真实性+历史成交额，模拟池暂时停用",
+
+  "filters": {
+    "valuation": {
+      "pe_percentile_max": 30.0,
+      "pb_percentile_max": 30.0,
+      "description": "PE或PB历史分位数 <= 30% 视为低估"
+    },
+    "growth": {
+      "peg_max": 1.0,
+      "description": "PEG < 1 视为有成长空间"
+    },
+    "liquidity": {
+      "avg_amount_20d_min": 100000000,
+      "description": "20日日均成交额 >= 1亿元（模拟池）",
+      "real_pool_min": 30000000,
+      "description_real": "真实池流动性下限放宽至3000万"
+    }
+  },
+
+  "real_pool": {
+    "description": "真实数据观察池 — 值得持续跟踪，非确定低估结论",
+    "mode": "any_of",
+    "conditions": [
+      {
+        "id": "pe_pb_real",
+        "field": "pe_pb_real_flag",
+        "op": "eq",
+        "value": true,
+        "label": "PE/PB来自真实数据源"
+      },
+      {
+        "id": "amount_real_history",
+        "field": "avg_amount_20d_flag",
+        "op": "in",
+        "value": ["real_history", "estimated_from_today"],
+        "label": "成交额来自历史或当日估算"
+      },
+      {
+        "id": "real_price_and_score",
+        "fields": ["price", "change_pct", "amount"],
+        "check": "all_not_null_and_price_gt_0",
+        "score_min": 40.0,
+        "label": "行情数据真实且评分达标"
+      }
+    ],
+    "bonus_conditions": [
+      {
+        "id": "main_index_etf",
+        "name_patterns": ["沪深300", "上证50", "中证500", "中证1000", "创业板", "科创50", "科创100", "中证红利", "深证100"],
+        "label": "主流指数ETF优先纳入"
+      }
+    ],
+    "score_min": 40.0,
+    "output_style": "observation"
+  },
+
+  "mock_pool": {
+    "description": "模拟估值参考池 — 严格低估筛选",
+    "mode": "all_of",
+    "conditions": [
+      {
+        "id": "valuation_low",
+        "logic": "pe_percentile <= 30 OR pb_percentile <= 30",
+        "label": "PE或PB分位处于低估区间"
+      },
+      {
+        "id": "growth_good",
+        "logic": "peg < 1",
+        "label": "PEG<1 有成长空间"
+      },
+      {
+        "id": "liquidity_enough",
+        "logic": "avg_amount_20d >= 100000000",
+        "label": "日均成交额≥1亿"
+      }
+    ]
+  },
+
+  "scoring": {
+    "_comment": "过渡版 v2.1: 伪分位权重(0.3+0.2)已重分配，pe/pb_percentile不再参与评分",
+    "weights": {
+      "pe_absolute_score": 0.30,
+      "peg_score": 0.35,
+      "liquidity_score": 0.35
+    },
+    "pe_percentile": {
+      "min": 0.0,
+      "max": 100.0,
+      "invert": true,
+      "description": "分位越低分数越高"
+    },
+    "pb_percentile": {
+      "min": 0.0,
+      "max": 100.0,
+      "invert": true,
+      "description": "分位越低分数越高"
+    },
+    "peg": {
+      "min": 0.0,
+      "max": 5.0,
+      "invert": true,
+      "description": "PEG越低分数越高，None视为中性(0.5分)"
+    },
+    "liquidity": {
+      "min_amount": 10000000,
+      "max_amount": 1000000000,
+      "description": "成交额越高分数越高"
+    }
+  },
+
+  "recommendation": {
+    "thresholds": {
+      "score_excellent": 80,
+      "score_good": 60,
+      "score_fair": 40
+    },
+    "templates": {
+      "excellent": "⭐⭐⭐ {name} 当前估值低位，成长性良好，流动性充足，建议重点关注",
+      "good": "⭐⭐ {name} 估值有一定吸引力，可考虑配置",
+      "fair": "⭐ {name} 基本满足低估条件，建议观察",
+      "no_data": "{name} 数据不完整，无法给出建议",
+      "no_signal": "{name} 当前估值信号不足",
+      "observation_excellent": "🔍 {name} 综合信号强，值得持续跟踪",
+      "observation_good": "🔍 {name} 有一定信号，建议关注",
+      "observation_fair": "🔍 {name} 基础信号存在，可列入观察名单"
+    }
+  },
+
+  "output": {
+    "json_file": "output/low_valuation_candidates_latest.json",
+    "report_file": "output/low_valuation_report_latest.md",
+    "top_n": 10
+  },
+
+  "data_quality": {
+    "allowed_flags": ["mock", "real", "mixed"],
+    "description": "兼容读取新旧格式的质量标记"
+  },
+
+  "log_level": "INFO"
+}

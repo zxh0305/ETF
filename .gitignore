@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data & Archives（按日期归档，太大不上传）
+archive/
+data/*.json
+!data/README.md
+
+# Outputs（PPT和日报产物，仅保留最新版本）
+output/*.pptx
+output/*.txt
+output/*.md
+output/*.json
+!output/README.md
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Task summaries（临时文件）
+task-summary-*.md
+
+# Secrets（不传token/密钥）
+.env
+*.env
+.env.*
+secrets/
+credentials/

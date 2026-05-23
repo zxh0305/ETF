@@ -1,0 +1,51 @@
+{
+  "agent_name": "ETF_估值数据采集",
+  "version": "2.0",
+  "schedule": {
+    "enabled": true,
+    "cron": "0 20 9 * * *",
+    "timezone": "Asia/Shanghai",
+    "description": "每天09:20自动执行"
+  },
+  "data_collection": {
+    "sources": [
+      "akshare"
+    ],
+    "fields": [
+      "code",
+      "name",
+      "price",
+      "change_pct",
+      "amount",
+      "turnover_rate",
+      "pe_ttm",
+      "pb"
+    ],
+    "min_amount": 10000000,
+    "categories": [
+      "宽基指数",
+      "科技",
+      "医药",
+      "新能源",
+      "消费",
+      "金融",
+      "周期",
+      "跨境",
+      "商品",
+      "债券"
+    ]
+  },
+  "output": {
+    "data_dir": "/Users/zhangxianghao/.qclaw/workspace/data",
+    "log_dir": "/Users/zhangxianghao/.qclaw/workspace/logs",
+    "format": "json",
+    "retention_days": 30
+  },
+  "notification": {
+    "on_success": false,
+    "on_failure": true,
+    "channels": [
+      "log"
+    ]
+  }
+}
