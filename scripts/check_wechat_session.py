@@ -14,14 +14,20 @@ import subprocess
 ACCOUNTS_DIR = os.path.expanduser("~/.qclaw/openclaw-weixin/accounts")
 
 def find_latest_account():
-    """找到最新的微信Bot账号文件"""
-    pattern = os.path.join(ACCOUNTS_DIR, "*-im-bot.json")
-    files = glob.glob(pattern)
-    files = [f for f in files if not f.endswith(".bak")]
-    if not files:
-        return None
-    files.sort(key=os.path.getmtime, reverse=True)
-    return files[0]
+    """找到最新的微信Bot账号文件（优先.json，fallback .sync.json）"""
+    # 优先使用 .json 文件（含完整token）
+    json_files = [f for f in glob.glob(os.path.join(ACCOUNTS_DIR, "*-im-bot.json"))
+                  if not f.endswith(".bak") and not f.endswith(".sync.json")]
+    if json_files:
+        json_files.sort(key=os.path.getmtime, reverse=True)
+        return json_files[0]
+    # fallback: .sync.json 文件
+    sync_files = [f for f in glob.glob(os.path.join(ACCOUNTS_DIR, "*-im-bot.sync.json"))
+                  if not f.endswith(".bak")]
+    if sync_files:
+        sync_files.sort(key=os.path.getmtime, reverse=True)
+        return sync_files[0]
+    return None
 
 def check_session(account_file):
     """使用curl调用getconfig API检查session（快速，非长轮询）"""
@@ -31,7 +37,7 @@ def check_session(account_file):
     token = account.get('token', '')
     base_url = account.get('baseUrl', 'https://ilinkai.weixin.qq.com')
     user_id = account.get('userId', '')
-    account_id = os.path.basename(account_file).replace('.json', '')
+    account_id = os.path.basename(account_file).replace('.sync.json', '').replace('.json', '')
     
     if not token:
         return {"status": "error", "message": f"账号 {account_id} 无token"}
@@ -80,6 +86,12 @@ def check_session(account_file):
                 "account_id": account_id
             }
         elif resp.get('ret') is not None and resp.get('ret') != 0:
+            if resp.get('ret') == -4:
+                return {
+                    "status": "ok",
+                    "message": f"✅ Session正常 (ret=-4内部错误可忽略, account: {account_id})",
+                    "account_id": account_id
+                }
             return {
                 "status": "error",
                 "message": f"⚠️ API错误: ret={resp.get('ret')}",

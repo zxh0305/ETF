@@ -201,8 +201,9 @@ class RiskController:
         Returns:
             List[ETFData]: 调整后的 ETF 列表
         """
-        # 分类：REAL vs ESTIMATED
+        # 分类：REAL vs RELIABLE_EST vs ESTIMATED
         real_etfs = [etf for etf in portfolio if etf.data_quality == "REAL"]
+        reliable_est_etfs = [etf for etf in portfolio if etf.data_quality == "RELIABLE_EST"]
         estimated_etfs = [etf for etf in portfolio if etf.data_quality == "ESTIMATED"]
         
         # REAL 数据限制
@@ -221,6 +222,25 @@ class RiskController:
             
             logger.warning(
                 f"REAL数据上限触发: 合计 {real_total:.2%} > 上限 {real_cap:.0%}，"
+                f"缩放比例 {scale:.2%}"
+            )
+        
+        # RELIABLE_EST 数据限制（新增）
+        reliable_est_cap = self.risk_config.reliable_est_data_cap
+        reliable_est_total = sum([etf.weight for etf in reliable_est_etfs])
+        
+        if reliable_est_total > reliable_est_cap:
+            scale = reliable_est_cap / reliable_est_total if reliable_est_total > 0 else 0
+            for etf in reliable_est_etfs:
+                old_weight = etf.weight
+                etf.weight *= scale
+                self.warnings.append(
+                    f"RELIABLE_EST数据上限触发: {etf.code} {etf.name} "
+                    f"weight {old_weight:.2%} → {etf.weight:.2%}"
+                )
+            
+            logger.warning(
+                f"RELIABLE_EST数据上限触发: 合计 {reliable_est_total:.2%} > 上限 {reliable_est_cap:.0%}，"
                 f"缩放比例 {scale:.2%}"
             )
         
@@ -295,9 +315,15 @@ class RiskController:
         threshold = self.risk_config.correlation_threshold
         cap = self.risk_config.correlation_cap
         
+        # 矩阵大小检查：如果ETF数量超过矩阵维度，跳过相关性约束
+        n = len(portfolio)
+        matrix_size = self.correlation_matrix.shape[0]
+        if n > matrix_size:
+            logger.warning(f"相关性矩阵({matrix_size}x{matrix_size})小于ETF数量({n})，跳过相关性约束")
+            return portfolio
+        
         # 找出高相关ETF对
         high_corr_pairs = []
-        n = len(portfolio)
         
         for i in range(n):
             for j in range(i+1, n):

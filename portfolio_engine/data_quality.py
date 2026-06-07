@@ -2,11 +2,12 @@
 """
 数据质量过滤器（Data Quality Filter）
 
-根据数据质量（REAL vs ESTIMATED）分配 max_weight。
+根据数据质量（REAL vs RELIABLE_EST vs ESTIMATED）分配 max_weight。
 
-规则：
-- REAL 数据（乐咕乐股20年历史分位） → max_weight = real_data_cap / N_real
-- ESTIMATED 数据（申万行业估算） → max_weight = estimated_data_cap / N_estimated
+数据质量等级：
+- REAL: 中证指数官方(csindex) 6年历史分位，最可靠
+- RELIABLE_EST: 申万行业加权PE/PB，基于真实成分股，较可靠
+- ESTIMATED: CNINFO/穿透估算，仅供参考
 
 输入：
 - etfs: List[ETFData]（来自筛选系统）
@@ -67,6 +68,7 @@ class DataQualityFilter:
         self.risk_config = risk_config
         logger.info(f"DataQualityFilter 初始化完成")
         logger.info(f"  - real_data_cap: {risk_config.real_data_cap:.0%}")
+        logger.info(f"  - relible_est_data_cap: {risk_config.reliable_est_data_cap:.0%}")
         logger.info(f"  - estimated_data_cap: {risk_config.estimated_data_cap:.0%}")
     
     def filter(self, etfs: List[ETFData]) -> List[ETFData]:
@@ -102,12 +104,13 @@ class DataQualityFilter:
             
             # 确保 data_quality 字段已设置
             if etf.data_quality is None:
-                # 尝试从 percentile_real_flag 推断
-                if etf.percentile_real_flag is not None:
-                    etf.data_quality = "REAL" if etf.percentile_real_flag else "ESTIMATED"
+                # 根据 percentile_real_flag 和 pe_pb_source 推断
+                if etf.percentile_real_flag:
+                    etf.data_quality = "REAL"
+                elif etf.pe_pb_source and '申万' in etf.pe_pb_source:
+                    etf.data_quality = "RELIABLE_EST"
                 else:
-                    logger.warning(f"[{i+1}] {etf.code} data_quality 未设置，跳过")
-                    continue
+                    etf.data_quality = "ESTIMATED"
             
             valid_etfs.append(etf)
         
@@ -118,48 +121,59 @@ class DataQualityFilter:
         
         logger.info(f"有效 ETF 数量: {len(valid_etfs)}")
         
+        # 确保 data_quality 字段已设置（fallback 推断）
+        for etf in valid_etfs:
+            if etf.data_quality is None or str(etf.data_quality).upper() == "N/A":
+                if etf.percentile_real_flag:
+                    etf.data_quality = "REAL"
+                elif etf.pe_pb_source and ('申万' in etf.pe_pb_source):
+                    etf.data_quality = "RELIABLE_EST"
+                else:
+                    etf.data_quality = "ESTIMATED"
+        
         # ------------------------------------------------------------------------
-        # 2. 分类：REAL vs ESTIMATED
+        # 2. 分类：REAL vs RELIABLE_EST vs ESTIMATED
         # ------------------------------------------------------------------------
         
         real_etfs = [etf for etf in valid_etfs if etf.data_quality == "REAL"]
+        reliable_est_etfs = [etf for etf in valid_etfs if etf.data_quality == "RELIABLE_EST"]
         estimated_etfs = [etf for etf in valid_etfs if etf.data_quality == "ESTIMATED"]
         
-        logger.info(f"REAL 数据 ETF: {len(real_etfs)} 只")
+        logger.info(f"RELIABLE_EST 数据 ETF: {len(reliable_est_etfs)} 只")
         logger.info(f"ESTIMATED 数据 ETF: {len(estimated_etfs)} 只")
         
         # ------------------------------------------------------------------------
-        # 3. 分配 max_weight
+        # 3. 分配 max_weight（单只上限 = single_etf_cap，合计上限由 RiskConfig 控制）
         # ------------------------------------------------------------------------
+        single_cap = self.risk_config.single_etf_cap
         
-        # REAL 数据：max_weight = real_data_cap / N_real
+        # REAL 数据：单只上限 = single_etf_cap（合计上限由 real_data_cap 控制）
         if real_etfs:
-            real_cap = self.risk_config.real_data_cap
-            real_weight = real_cap / len(real_etfs)
-            
             for etf in real_etfs:
-                etf.max_weight = real_weight
-            
-            logger.info(f"REAL 数据 max_weight 分配完成: {real_weight:.2%} / 只")
+                etf.max_weight = single_cap
+            logger.info(f"REAL 数据 max_weight 分配完成: {single_cap:.2%} / 只（合计上限 {self.risk_config.real_data_cap:.0%}）")
         
-        # ESTIMATED 数据：max_weight = estimated_data_cap / N_estimated
+        # RELIABLE_EST 数据：单只上限 = single_etf_cap（合计上限由 reliable_est_data_cap 控制）
+        if reliable_est_etfs:
+            for etf in reliable_est_etfs:
+                etf.max_weight = single_cap
+            logger.info(f"RELIABLE_EST 数据 max_weight 分配完成: {single_cap:.2%} / 只（合计上限 {self.risk_config.reliable_est_data_cap:.0%}）")
+        
+        # ESTIMATED 数据：单只上限 = single_etf_cap（合计上限由 estimated_data_cap 控制）
         if estimated_etfs:
-            estimated_cap = self.risk_config.estimated_data_cap
-            estimated_weight = estimated_cap / len(estimated_etfs)
-            
             for etf in estimated_etfs:
-                etf.max_weight = estimated_weight
-            
-            logger.info(f"ESTIMATED 数据 max_weight 分配完成: {estimated_weight:.2%} / 只")
+                etf.max_weight = single_cap
+            logger.info(f"ESTIMATED 数据 max_weight 分配完成: {single_cap:.2%} / 只（合计上限 {self.risk_config.estimated_data_cap:.0%}）")
         
         # ------------------------------------------------------------------------
         # 4. 合并并返回
         # ------------------------------------------------------------------------
         
-        filtered = real_etfs + estimated_etfs
+        filtered = real_etfs + reliable_est_etfs + estimated_etfs
         
         logger.info(f"✅ 数据质量过滤完成: {len(filtered)} 只 ETF")
         logger.info(f"  - REAL 数据: {len(real_etfs)} 只，合计上限 {self.risk_config.real_data_cap:.0%}")
+        logger.info(f"  - RELIABLE_EST 数据: {len(reliable_est_etfs)} 只，合计上限 {self.risk_config.reliable_est_data_cap:.0%}")
         logger.info(f"  - ESTIMATED 数据: {len(estimated_etfs)} 只，合计上限 {self.risk_config.estimated_data_cap:.0%}")
         
         return filtered

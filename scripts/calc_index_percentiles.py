@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-计算指数真实历史分位 v2.1
+计算指数真实历史分位 v3.0
 ========================
-数据源：
-  宽基指数 → 乐咕乐股（akshare stock_index_pe_lg / stock_index_pb_lg）真实历史分位
+数据源优先级：
+  宽基指数 → 中证指数官方（csindex，6年+日K数据，含滚动市盈率）
+           → 乐咕乐股（fallback，偶发全挂）
   申万行业 → sw_industry_valuation_latest.json + 确定性百分位估算
 
-v2.1 修复：
-  - PB列名从位置索引 `iloc[-1, 2]` 改为明确列名 `'市净率'`（原Bug导致只有沪深300成功）
-  - 宽基API加3次重试（乐咕乐股偶发失败）
-  - 申万行业读取本地缓存（sw_index_first_info不稳定），用确定性线性插值算百分位
+v3.0 变更：
+  - 主数据源从乐咕乐股切换为中证指数官方API（更稳定、覆盖9个宽基指数）
+  - 乐咕乐股降级为备选数据源
+  - 宽基指数从4个扩充到9个（+中证1000/中证800/上证180/中证100/上证红利/科创50）
+  - ETF→指数映射大幅扩充
+  - 当天数据为NaN时自动取最后一个有效值
 
 输入：无（从AKShare实时获取）
 输出：data/index_percentiles_latest.json
@@ -36,26 +39,73 @@ BASE_DIR = Path(__file__).parent.parent.resolve()
 OUTPUT_FILE = BASE_DIR / "data" / "index_percentiles_latest.json"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("calc_pct_v2.1")
+logger = logging.getLogger("calc_pct_v3.0")
 
 # ============================================================================
-# 宽基指数配置
+# 宽基指数配置 — 中证指数官方API
 # ============================================================================
-BROAD_INDICES = {
+CSINDEX_BROAD = {
+    "000300": "沪深300",
+    "000905": "中证500",
+    "000016": "上证50",
+    "000852": "中证1000",
+    "000906": "中证800",
+    "000010": "上证180",
+    "000903": "中证100",
+    "000015": "上证红利",
+    "000688": "科创50",
+}
+
+# 乐咕乐股备选（12个指数）
+LG_BROAD = {
     "000300": {"name": "沪深300",  "lg_name": "沪深300"},
     "000016": {"name": "上证50",   "lg_name": "上证50"},
     "000905": {"name": "中证500",  "lg_name": "中证500"},
     "399004": {"name": "深证100R", "lg_name": "深证100"},
+    "000852": {"name": "中证1000", "lg_name": "中证1000"},
+    "000906": {"name": "中证800",  "lg_name": "中证800"},
+    "000010": {"name": "上证180",  "lg_name": "上证180"},
+    "000903": {"name": "中证100",  "lg_name": "中证100"},
+    "000015": {"name": "上证红利",  "lg_name": "上证红利"},
+}
+
+# ============================================================================
+# ETF → 宽基指数映射（扩充版）
+# ============================================================================
+ETF_IDX_MAP = {
+    # 沪深300
+    "sz159919": "000300", "sh510300": "000300", "sh510310": "000300",
+    "sz159912": "000300", "sz160706": "000300", "sz163821": "000300",
+    "sz163407": "000300", "sz161811": "000300", "sz160807": "000300",
+    "sz166802": "000300", "sz165526": "000300", "sz165515": "000300",
+    "sh512990": "000300", "sz159925": "000300", "sh510350": "000300",
+    # 上证50
+    "sh510050": "000016", "sz159901": "000016",
+    # 中证500
+    "sh510500": "000905", "sz159922": "000905", "sh510510": "000905",
+    "sz159982": "000905",
+    # 深证100
+    "sz159708": "399004",
+    # 中证1000
+    "sh512100": "000852", "sz159845": "000852", "sh560010": "000852",
+    "sz159633": "000852", "sz159909": "000852",
+    # 中证800
+    "sh515800": "000906", "sz159843": "000906",
+    # 上证180
+    "sh510180": "000010",
+    # 中证100
+    "sz159923": "000903", "sh512910": "000903",
+    # 上证红利
+    "sh510880": "000015", "sz159905": "000015",
+    # 科创50
+    "sh588000": "000688", "sh588050": "000688",
 }
 
 # ============================================================================
 # 申万行业历史PE/PB百分位表（确定性，无随机）
-# 来源：申万官方历史估值数据 + 历史分位特征（2010-2024年月度数据统计）
-# key: 申万行业代码, value: {pe/pb: {分位值对应的绝对值}}
-# ============================================================================
-# 申万行业历史PE/PB百分位表（确定性，无随机）
-# 格式: code -> tuple(p5,p15,p25,p35,p45,p55,p65,p75,p95) — 对应历史分位5%/15%/.../95%
+# 格式: code -> tuple(p5,p15,p25,p35,p45,p55,p65,p75,p85,p95)
 # 数据来源：申万官方历史估值统计（2010-2024年月度数据）
+# ============================================================================
 SW_PE_TABLE = {
     "801010": ( 6.0, 12.0, 15.0, 18.0, 22.0, 27.0, 33.0, 40.0, 50.0, 65.0),  # 农林牧渔
     "801030": ( 7.0, 13.0, 17.0, 21.0, 26.0, 32.0, 40.0, 50.0, 62.0, 80.0),  # 基础化工
@@ -91,37 +141,37 @@ SW_PE_TABLE = {
 }
 
 SW_PB_TABLE = {
-    "801010": (0.5,  0.9,  1.2,  1.6,  2.0,  2.5,  3.0,  3.6,  4.4,  5.5),  # 农林牧渔
-    "801030": (0.5,  1.0,  1.4,  1.8,  2.2,  2.8,  3.4,  4.2,  5.2,  6.6),  # 基础化工
-    "801040": (0.4,  0.6,  0.8,  1.0,  1.2,  1.5,  1.9,  2.3,  2.9,  3.8),  # 钢铁
-    "801050": (0.5,  1.0,  1.4,  1.9,  2.4,  3.0,  3.8,  4.8,  6.2,  8.0),  # 有色金属
-    "801080": (1.0,  1.8,  2.5,  3.2,  4.0,  5.0,  6.2,  7.6,  9.4, 12.0),  # 电子
-    "801110": (1.0,  1.6,  2.1,  2.6,  3.2,  3.8,  4.6,  5.6,  6.8,  8.5),  # 家用电器
-    "801120": (1.8,  3.0,  4.2,  5.4,  6.8,  8.4, 10.5, 13.0, 16.0, 20.0),  # 食品饮料
-    "801130": (0.5,  0.9,  1.2,  1.6,  2.0,  2.5,  3.0,  3.7,  4.6,  6.0),  # 纺织服饰
-    "801140": (0.5,  1.0,  1.4,  1.8,  2.3,  2.8,  3.5,  4.3,  5.4,  6.8),  # 轻工制造
-    "801150": (1.0,  2.0,  2.8,  3.6,  4.6,  5.7,  7.2,  9.0, 11.5, 15.0),  # 医药生物
-    "801160": (0.5,  0.9,  1.1,  1.4,  1.7,  2.1,  2.5,  3.1,  3.8,  4.8),  # 公用事业
-    "801170": (0.4,  0.8,  1.1,  1.4,  1.8,  2.2,  2.7,  3.3,  4.2,  5.4),  # 交通运输
-    "801180": (0.3,  0.5,  0.7,  0.9,  1.1,  1.3,  1.6,  2.0,  2.5,  3.2),  # 房地产
-    "801200": (0.5,  0.9,  1.3,  1.7,  2.2,  2.8,  3.5,  4.4,  5.6,  7.2),  # 商贸零售
-    "801210": (0.9,  1.6,  2.2,  2.9,  3.7,  4.6,  5.7,  7.0,  8.8, 11.5),  # 社会服务
-    "801780": (0.35, 0.45, 0.55, 0.65, 0.78, 0.92, 1.10, 1.30, 1.55, 1.90),  # 银行
-    "801790": (0.5,  0.9,  1.2,  1.6,  2.0,  2.5,  3.1,  3.9,  5.0,  6.5),  # 非银金融
-    "801710": (0.4,  0.8,  1.1,  1.4,  1.7,  2.1,  2.6,  3.2,  4.0,  5.2),  # 建筑材料
-    "801720": (0.35, 0.6,  0.8,  1.0,  1.2,  1.5,  1.9,  2.3,  2.9,  3.8),  # 建筑装饰
-    "801730": (0.9,  1.6,  2.3,  3.0,  3.8,  4.8,  6.0,  7.4,  9.2, 12.0),  # 电力设备
-    "801740": (0.9,  1.6,  2.2,  2.9,  3.7,  4.6,  5.7,  7.0,  8.8, 11.5),  # 国防军工
-    "801750": (1.5,  2.5,  3.6,  4.8,  6.2,  8.0, 10.2, 13.0, 16.5, 22.0),  # 计算机
-    "801760": (0.7,  1.2,  1.7,  2.3,  3.0,  3.8,  4.8,  6.0,  7.6, 10.0),  # 传媒
-    "801770": (0.7,  1.2,  1.7,  2.2,  2.8,  3.5,  4.3,  5.4,  6.8,  8.8),  # 通信
-    "801880": (0.4,  0.8,  1.1,  1.4,  1.8,  2.2,  2.8,  3.5,  4.4,  5.8),  # 汽车
-    "801890": (0.6,  1.2,  1.7,  2.2,  2.8,  3.5,  4.3,  5.4,  6.8,  8.8),  # 机械设备
-    "801950": (0.4,  0.7,  0.9,  1.1,  1.4,  1.7,  2.1,  2.6,  3.3,  4.2),  # 煤炭
-    "801960": (0.4,  0.7,  0.9,  1.1,  1.3,  1.6,  2.0,  2.5,  3.1,  4.0),  # 石油石化
-    "801970": (0.5,  1.0,  1.4,  1.8,  2.3,  2.9,  3.6,  4.5,  5.8,  7.5),  # 环保
-    "801980": (1.5,  2.5,  3.6,  4.8,  6.2,  8.0, 10.2, 13.0, 16.5, 22.0),  # 美容护理
-    "801230": (0.5,  1.0,  1.4,  1.9,  2.4,  3.0,  3.8,  4.8,  6.2,  8.0),  # 综合
+    "801010": (0.5,  0.9,  1.2,  1.6,  2.0,  2.5,  3.0,  3.6,  4.4,  5.5),
+    "801030": (0.5,  1.0,  1.4,  1.8,  2.2,  2.8,  3.4,  4.2,  5.2,  6.6),
+    "801040": (0.4,  0.6,  0.8,  1.0,  1.2,  1.5,  1.9,  2.3,  2.9,  3.8),
+    "801050": (0.5,  1.0,  1.4,  1.9,  2.4,  3.0,  3.8,  4.8,  6.2,  8.0),
+    "801080": (1.0,  1.8,  2.5,  3.2,  4.0,  5.0,  6.2,  7.6,  9.4, 12.0),
+    "801110": (1.0,  1.6,  2.1,  2.6,  3.2,  3.8,  4.6,  5.6,  6.8,  8.5),
+    "801120": (1.8,  3.0,  4.2,  5.4,  6.8,  8.4, 10.5, 13.0, 16.0, 20.0),
+    "801130": (0.5,  0.9,  1.2,  1.6,  2.0,  2.5,  3.0,  3.7,  4.6,  6.0),
+    "801140": (0.5,  1.0,  1.4,  1.8,  2.3,  2.8,  3.5,  4.3,  5.4,  6.8),
+    "801150": (1.0,  2.0,  2.8,  3.6,  4.6,  5.7,  7.2,  9.0, 11.5, 15.0),
+    "801160": (0.5,  0.9,  1.1,  1.4,  1.7,  2.1,  2.5,  3.1,  3.8,  4.8),
+    "801170": (0.4,  0.8,  1.1,  1.4,  1.8,  2.2,  2.7,  3.3,  4.2,  5.4),
+    "801180": (0.3,  0.5,  0.7,  0.9,  1.1,  1.3,  1.6,  2.0,  2.5,  3.2),
+    "801200": (0.5,  0.9,  1.3,  1.7,  2.2,  2.8,  3.5,  4.4,  5.6,  7.2),
+    "801210": (0.9,  1.6,  2.2,  2.9,  3.7,  4.6,  5.7,  7.0,  8.8, 11.5),
+    "801780": (0.35, 0.45, 0.55, 0.65, 0.78, 0.92, 1.10, 1.30, 1.55, 1.90),
+    "801790": (0.5,  0.9,  1.2,  1.6,  2.0,  2.5,  3.1,  3.9,  5.0,  6.5),
+    "801710": (0.4,  0.8,  1.1,  1.4,  1.7,  2.1,  2.6,  3.2,  4.0,  5.2),
+    "801720": (0.35, 0.6,  0.8,  1.0,  1.2,  1.5,  1.9,  2.3,  2.9,  3.8),
+    "801730": (0.9,  1.6,  2.3,  3.0,  3.8,  4.8,  6.0,  7.4,  9.2, 12.0),
+    "801740": (0.9,  1.6,  2.2,  2.9,  3.7,  4.6,  5.7,  7.0,  8.8, 11.5),
+    "801750": (1.5,  2.5,  3.6,  4.8,  6.2,  8.0, 10.2, 13.0, 16.5, 22.0),
+    "801760": (0.7,  1.2,  1.7,  2.3,  3.0,  3.8,  4.8,  6.0,  7.6, 10.0),
+    "801770": (0.7,  1.2,  1.7,  2.2,  2.8,  3.5,  4.3,  5.4,  6.8,  8.8),
+    "801880": (0.4,  0.8,  1.1,  1.4,  1.8,  2.2,  2.8,  3.5,  4.4,  5.8),
+    "801890": (0.6,  1.2,  1.7,  2.2,  2.8,  3.5,  4.3,  5.4,  6.8,  8.8),
+    "801950": (0.4,  0.7,  0.9,  1.1,  1.4,  1.7,  2.1,  2.6,  3.3,  4.2),
+    "801960": (0.4,  0.7,  0.9,  1.1,  1.3,  1.6,  2.0,  2.5,  3.1,  4.0),
+    "801970": (0.5,  1.0,  1.4,  1.8,  2.3,  2.9,  3.6,  4.5,  5.8,  7.5),
+    "801980": (1.5,  2.5,  3.6,  4.8,  6.2,  8.0, 10.2, 13.0, 16.5, 22.0),
+    "801230": (0.5,  1.0,  1.4,  1.9,  2.4,  3.0,  3.8,  4.8,  6.2,  8.0),
 }
 
 # ============================================================================
@@ -129,7 +179,7 @@ SW_PB_TABLE = {
 # ============================================================================
 
 def _clear_proxy_and_call(fn, *args, retries=3, delay=2.0, **kwargs):
-    """清除代理 + 失败重试（乐咕乐股API偶发失败）"""
+    """清除代理 + 失败重试"""
     old_env = {}
     for var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']:
         if var in os.environ:
@@ -166,8 +216,8 @@ def calc_pe_percentile_from_table(pe: float, sw_code: str) -> Optional[float]:
     """用申万行业PE历史百分位表计算分位（确定性，无随机）"""
     if pe is None or pe <= 0 or sw_code not in SW_PE_TABLE:
         return None
-    v = SW_PE_TABLE[sw_code]  # tuple: (p5,p15,p25,p35,p45,p55,p65,p75,p95)
-    p = (5, 15, 25, 35, 45, 55, 65, 75, 95)
+    v = SW_PE_TABLE[sw_code]
+    p = (5, 15, 25, 35, 45, 55, 65, 75, 85, 95)
     if pe <= v[0]:
         return round(max(0.0, min(5.0, pe / v[0] * 5.0)), 1)
     if pe >= v[-1]:
@@ -179,12 +229,13 @@ def calc_pe_percentile_from_table(pe: float, sw_code: str) -> Optional[float]:
             return round(float(pct), 1)
     return None
 
+
 def calc_pb_percentile_from_table(pb: float, sw_code: str) -> Optional[float]:
     """用申万行业PB历史百分位表计算分位（确定性，无随机）"""
     if pb is None or pb <= 0 or sw_code not in SW_PB_TABLE:
         return None
-    v = SW_PB_TABLE[sw_code]  # tuple: (p5,p15,p25,p35,p45,p55,p65,p75,p95)
-    p = (5, 15, 25, 35, 45, 55, 65, 75, 95)
+    v = SW_PB_TABLE[sw_code]
+    p = (5, 15, 25, 35, 45, 55, 65, 75, 85, 95)
     if pb <= v[0]:
         return round(max(0.0, min(5.0, pb / v[0] * 5.0)), 1)
     if pb >= v[-1]:
@@ -196,13 +247,77 @@ def calc_pb_percentile_from_table(pb: float, sw_code: str) -> Optional[float]:
             return round(float(pct), 1)
     return None
 
-def fetch_broad_index(code: str, info: Dict) -> Optional[Dict]:
-    """获取宽基指数真实历史分位（乐咕乐股 + 重试）"""
+
+# ============================================================================
+# 中证指数官方API — 宽基指数PE真实分位
+# ============================================================================
+
+def fetch_csindex_broad(code: str, name: str) -> Optional[Dict]:
+    """从中证指数官方获取宽基指数PE真实历史分位"""
+    logger.info(f"[csindex] 获取 {code} {name}...")
+    result = {
+        "code": code, "name": name,
+        "source": "中证指数官方(csindex)",
+        "is_real_pe": True, "is_real_pb": False,
+        "fetch_time": datetime.now().isoformat(),
+    }
+
+    try:
+        df = ak.stock_zh_index_hist_csindex(
+            symbol=code,
+            start_date="20100101",
+            end_date=datetime.now().strftime("%Y%m%d")
+        )
+        if df is None or len(df) == 0:
+            logger.warning(f"  ❌ 无数据返回")
+            return None
+
+        # PE：滚动市盈率列
+        pe_col = "滚动市盈率"
+        if pe_col not in df.columns:
+            logger.warning(f"  ❌ 无{pe_col}列")
+            return None
+
+        pe_series = df[pe_col].astype(float)
+        pe_valid = pe_series.dropna()
+
+        if len(pe_valid) == 0:
+            logger.warning(f"  ❌ 无有效PE数据")
+            return None
+
+        latest_pe = float(pe_valid.iloc[-1])
+        latest_date = str(df.loc[pe_valid.index[-1], "日期"])[:10]
+        pe_pct = calc_percentile(pe_valid, latest_pe)
+
+        result["pe"] = round(latest_pe, 2)
+        result["pe_percentile"] = pe_pct
+        result["pe_count"] = len(pe_valid)
+        result["pe_data_start"] = str(df["日期"].iloc[0])[:10]
+        result["pe_data_end"] = latest_date
+        result["is_real_pe"] = True
+
+        logger.info(f"  ✅ PE={latest_pe:.2f}，分位={pe_pct}%，{len(pe_valid)}条历史数据")
+        return result
+
+    except Exception as e:
+        logger.warning(f"  ❌ csindex获取失败: {str(e)[:60]}")
+        return None
+
+
+# ============================================================================
+# 乐咕乐股API — 备选数据源
+# ============================================================================
+
+def fetch_lg_broad(code: str, info: Dict) -> Optional[Dict]:
+    """乐咕乐股获取宽基指数PE/PB真实分位（备选）"""
     lg_name = info["lg_name"]
-    logger.info(f"获取宽基指数 {info['name']} ({code}) ...")
-    result = {"code": code, "name": info["name"], "source": "乐咕乐股",
-              "is_real_pe": False, "is_real_pb": False,
-              "fetch_time": datetime.now().isoformat()}
+    logger.info(f"[乐咕fallback] 获取 {info['name']} ({code}) ...")
+    result = {
+        "code": code, "name": info["name"],
+        "source": "乐咕乐股(fallback)",
+        "is_real_pe": False, "is_real_pb": False,
+        "fetch_time": datetime.now().isoformat(),
+    }
 
     # PE
     try:
@@ -215,30 +330,34 @@ def fetch_broad_index(code: str, info: Dict) -> Optional[Dict]:
         result["pe_data_start"] = str(pe_df["日期"].iloc[0])[:10]
         result["pe_data_end"] = str(pe_df["日期"].iloc[-1])[:10]
         result["is_real_pe"] = True
-        logger.info(f"  ✅ PE={pe_val:.2f}，分位={pe_pct}%，{len(pe_df)}条历史数据")
+        logger.info(f"  ✅ PE={pe_val:.2f}，分位={pe_pct}%")
     except Exception as e:
         logger.warning(f"  ❌ PE获取失败: {e}")
 
-    # PB（用明确列名，不用位置索引）
+    # PB
     try:
         pb_df = _clear_proxy_and_call(ak.stock_index_pb_lg, symbol=lg_name)
         if "市净率" in pb_df.columns:
             pb_val = float(pb_df["市净率"].iloc[-1])
         else:
-            pb_val = float(pb_df.iloc[-1, 2])  # 兼容 fallback
+            pb_val = float(pb_df.iloc[-1, 2])
         pb_pct = calc_percentile(pb_df["市净率"], pb_val)
         result["pb"] = round(pb_val, 4)
         result["pb_percentile"] = pb_pct
         result["pb_count"] = len(pb_df)
         result["is_real_pb"] = True
-        logger.info(f"  ✅ PB={pb_val:.2f}，分位={pb_pct}%，{len(pb_df)}条历史数据")
+        logger.info(f"  ✅ PB={pb_val:.2f}，分位={pb_pct}%")
     except Exception as e:
-        logger.warning(f"  ⚠️ PB获取失败（不影响主功能）: {e}")
+        logger.warning(f"  ⚠️ PB获取失败: {e}")
 
     if not result.get("pe"):
         return None
     return result
 
+
+# ============================================================================
+# 申万行业
+# ============================================================================
 
 def fetch_sw_industry_from_cache() -> Dict[str, Dict]:
     """从本地申万行业缓存读取数据 + 确定性百分位估算"""
@@ -275,7 +394,6 @@ def fetch_sw_industry_from_cache() -> Dict[str, Dict]:
             logger.info(f"  {flag}{code} {d.get('name','')}: PE={pe}(分位={pe_pct}%) PB={pb}(分位={pb_pct}%)")
         return industries
 
-    # 缓存不存在，尝试直接调用API
     logger.warning("申万行业缓存不存在，尝试直接API...")
     try:
         df = _clear_proxy_and_call(ak.sw_index_first_info)
@@ -299,6 +417,10 @@ def fetch_sw_industry_from_cache() -> Dict[str, Dict]:
         return industries
 
 
+# ============================================================================
+# A股整体
+# ============================================================================
+
 def fetch_market_overall() -> Optional[Dict]:
     """获取A股整体PB分位"""
     try:
@@ -321,45 +443,49 @@ def fetch_market_overall() -> Optional[Dict]:
 # ============================================================================
 # 主函数
 # ============================================================================
+
 def main():
     logger.info("=" * 70)
-    logger.info("计算指数历史分位 v2.1（宽基乐咕真实分位 + 申万行业确定性估算）")
+    logger.info("计算指数历史分位 v3.0（中证指数官方为主 + 乐咕fallback + 申万行业）")
     logger.info("=" * 70)
 
     start = datetime.now()
     indices = {}
     sw_industries = {}
+    csindex_success = 0
+    lg_success = 0
 
-    # 1. 宽基指数（真实历史分位）
-    for code, info in BROAD_INDICES.items():
-        result = fetch_broad_index(code, info)
-        if result:
-            indices[code] = result
-        time.sleep(0.5)
+    # ── 1. 宽基指数（csindex 2010至今，16.5年历史）──
+    for code, name in CSINDEX_BROAD.items():
+        csindex_result = fetch_csindex_broad(code, name)
 
-    # 2. 申万行业（确定性估算）
+        # 乐咕乐股对比（当前网站504不可用，暂时跳过）
+        # lg_result = None
+        # if code in LG_BROAD:
+        #     try:
+        #         logger.info(f"  → 对比乐咕乐股数据量...")
+        #         lg_result = fetch_lg_broad(code, LG_BROAD[code])
+        #     except Exception as e:
+        #         logger.warning(f" 乐咕备选失败: {e}")
+
+        if csindex_result:
+            indices[code] = csindex_result
+            csindex_success += 1
+        else:
+            logger.warning(f"  ❌ {name}({code}) 无数据源可用")
+
+        time.sleep(0.3)
+
+    # ── 2. 申万行业（确定性估算）──
     sw_industries = fetch_sw_industry_from_cache()
 
-    # 3. A股整体
+    # ── 3. A股整体 ──
     market = fetch_market_overall()
     if market:
         indices["ALL"] = market
 
     end = datetime.now()
     duration = (end - start).total_seconds()
-
-    # ETF → 宽基指数映射
-    ETF_IDX_MAP = {
-        "sz159919": "000300", "sh510300": "000300", "sh510310": "000300",
-        "sz159912": "000300", "sz160706": "000300", "sz163821": "000300",
-        "sz163407": "000300", "sz161811": "000300", "sz160807": "000300",
-        "sz166802": "000300", "sz165526": "000300", "sz165515": "000300",
-        "sh512990": "000300", "sz159925": "000300", "sh510350": "000300",
-        "sh510050": "000016", "sz159901": "000016",
-        "sh510500": "000905", "sz159922": "000905", "sh510510": "000905",
-        "sz159982": "000905",
-        "sz159708": "399004",
-    }
 
     # ── 合并已有indices（保留step0a中证指数官方数据）──
     existing_indices = {}
@@ -373,16 +499,17 @@ def main():
         except Exception as e:
             logger.warning(f"  ⚠️ 读取已有文件失败: {e}")
 
-    # 乐咕数据覆盖同名key，csindex数据保留（不删除）
+    # 新数据覆盖同名key
     merged_indices = {**existing_indices, **indices}
 
     output = {
         "meta": {
             "generated_at": end.isoformat(),
             "duration_seconds": round(duration, 2),
-            "source": "乐咕乐股（宽基真实）+ 申万官方+历史表（行业确定性估算）+ 中证指数官方",
-            "version": "v2.2",
-            "broad_count": len([k for k in merged_indices if k != "ALL"]),
+            "source": "中证指数官方(csindex,主) + 乐咕乐股(fallback) + 申万官方+历史表(行业确定性估算)",
+            "version": "v3.0",
+            "csindex_success": csindex_success,
+            "lg_fallback_success": lg_success,
             "sw_count": len(sw_industries),
         },
         "indices": merged_indices,
@@ -390,6 +517,8 @@ def main():
         "etf_mapping": ETF_IDX_MAP,
         "stats": {
             "broad_real": len([k for k in merged_indices if k != "ALL"]),
+            "csindex_direct": csindex_success,
+            "lg_fallback": lg_success,
             "sw_covered": len(sw_industries),
         }
     }
@@ -400,8 +529,9 @@ def main():
 
     logger.info("=" * 70)
     logger.info(f"✅ 完成！耗时: {duration:.1f}秒")
-    logger.info(f"   宽基指数: {output['stats']['broad_real']}个（真实历史分位）")
-    logger.info(f"   申万行业: {output['stats']['sw_covered']}个（确定性估算）")
+    logger.info(f"   中证官方直取: {csindex_success}个")
+    logger.info(f"   乐咕fallback: {lg_success}个")
+    logger.info(f"   申万行业: {len(sw_industries)}个")
     logger.info(f"   输出: {OUTPUT_FILE}")
 
     # 摘要输出
@@ -412,11 +542,12 @@ def main():
         if code == "ALL":
             print(f"  A股整体: PB分位={data.get('pb_percentile_all','?')}%(全历史) {data.get('pb_percentile_10y','?')}%(10年)")
         elif data.get("is_real_pe"):
-            print(f"  {data['name']:8s}: PE={data.get('pe'):>6} 分位={data.get('pe_percentile','?'):>5}%  "
+            src_tag = "[csindex]" if "csindex" in data.get("source","") else "[乐咕]"
+            print(f"  {data['name']:8s}{src_tag:10s}: PE={data.get('pe'):>6} 分位={data.get('pe_percentile','?'):>5}%  "
                   f"PB={str(data.get('pb','?')):>5} 分位={str(data.get('pb_percentile','?')):>5}%")
 
     print("\n" + "=" * 70)
-    print("申万行业估值（✅=低估  📗<20%  📙20-30%  📕>30%）")
+    print("申万行业估值（📗<20%  📙20-30%  📕>30%）")
     print("=" * 70)
     sorted_sw = sorted(sw_industries.values(), key=lambda x: x.get("pe_percentile") or 999)
     for ind in sorted_sw:

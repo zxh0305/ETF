@@ -20,7 +20,7 @@ ETF估值补全脚本 v6.6 - csindex官方PE+申万行业+实时成交额
 输出: data/etf_valuation_latest.json
 """
 
-import json, logging, os, time
+import json, logging, math, os, time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -179,7 +179,7 @@ ETF_NAME_KW_MAP = {
     # --- 801790 非银金融 ---
     "保险": "801790", "险企": "801790", "险资": "801790",
     "证券": "801790", "券商": "801790", "投行": "801790", "多元金融": "801790", "非银金融": "801790",
-    "金融": "801790", "红利": "801790",
+    "金融": "801790",
     # --- 801880 汽车 (v3.0新增) ---
     "汽车整车": "801880", "汽车": "801880", "汽车零部件": "801880", "新能源车": "801880",
     # --- 801890 机械设备 (v3.0新增) ---
@@ -189,11 +189,10 @@ ETF_NAME_KW_MAP = {
     "美容": "801980", "化妆品": "801980", "护肤": "801980",
     # --- 801230 综合 (无特定行业关键词，留空) ---
     # --- 模糊/兜底映射 ---
-    "价值": "801790", "分红": "801780",
     "家居": "801140",
     "能源": "801960",
-    # --- 宽基数字简写 ---
-    "300": "801120", "500": "801050",
+    # --- 宽基数字简写（已禁用跨行业误匹配；仅作last resort模糊匹配）---
+    # "300": "801120", "500": "801050",
 }
 
 SW_CODE_TO_NAME = {
@@ -456,7 +455,7 @@ class ETFValuationEnricherV5:
             return None
         idx = self.idx_data.get("indices", {}).get(idx_code)
 
-        # 主路径：中证指数官方真实PE分位 (v6.6 优先)
+        # 主路径：中证指数官方真实PE分位 (v6.7: 2010至今16.5年)
         if idx and idx.get("is_real_pe") and "csindex" in (idx.get("source") or "").lower():
             pe_val = idx.get("pe")
             pe_pct = idx.get("pe_percentile")
@@ -519,6 +518,7 @@ class ETFValuationEnricherV5:
                 "index_code": idx_code, "index_name": idx_name,
                 "source": f"降级(估算PE+申万分位)",
                 "data_years": 0,
+                "percentile_real_flag": False,
             }
 
         return None
@@ -671,7 +671,7 @@ class ETFValuationEnricherV5:
             pe = idx_data["pe"]; pb = idx_data.get("pb")
             pe_pct = idx_data["pe_percentile"]; pb_pct = idx_data.get("pb_percentile")
             source = idx_data.get("source", "指数") + f"-{idx_data['index_name']}"
-            percentile_real = True
+            percentile_real = idx_data.get("percentile_real_flag", True)
             # v6.6: 标记PB分位是否真实（csindex不提供PB，申万近似的不纳入筛选）
             pb_real = idx_data.get("pb_real", True)  # 默认True(兼容旧数据)
             if not pb_real and pb_pct is not None:
@@ -713,6 +713,20 @@ class ETFValuationEnricherV5:
             percentile_real = False
             self.stats["unavailable"] += 1
 
+        # -------------------- PEG计算（ROE法）---------------------
+        # PEG = PE / 可持续增速
+        # 可持续增速 ≈ ROE × (1 - 分红率)，ROE ≈ PB/PE
+        # 分红率默认30%，留存率=70%
+        peg = None
+        peg_source = None
+        if pe and pb and pb > 0 and pe > 0:
+            roe_estimate = (pb / pe) * 100  # ROE百分比
+            retention_ratio = 0.7
+            growth_rate = roe_estimate * retention_ratio
+            if growth_rate >= 0.5:  # 有效增速门槛
+                peg = round(pe / growth_rate, 2)
+                peg_source = "ROE法(留存70%)"
+
         avg_amount = self.sina_fetcher.get_amount(code, existing_amount=record.get('amount'))
         if avg_amount:
             self.stats["amount_ok"] += 1
@@ -737,6 +751,12 @@ class ETFValuationEnricherV5:
 
         quality = "real" if percentile_real and avg_amount else "partial" if (percentile_real or avg_amount) else "unavailable"
 
+        # NaN防护：将NaN转为None，避免json.dump写出非法JSON
+        if isinstance(pe, float) and math.isnan(pe): pe = None
+        if isinstance(pb, float) and math.isnan(pb): pb = None
+        if isinstance(pe_pct, float) and math.isnan(pe_pct): pe_pct = None
+        if isinstance(pb_pct, float) and math.isnan(pb_pct): pb_pct = None
+
         return {
             **record,
             "pe_ttm": pe, "pb": pb,
@@ -745,6 +765,8 @@ class ETFValuationEnricherV5:
             "pe_pb_source": source,
             "avg_amount_20d": avg_amount,
             "valuation_signal": valuation_signal,
+            "peg": peg,
+            "peg_source": peg_source,
             "growth_signal": growth_signal,
             "liquidity_level": liq_level,
             "liquidity_signal": liq_signal,

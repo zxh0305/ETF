@@ -51,7 +51,7 @@ class ETFData:
     - avg_amount_20d: 20 日平均成交额（单位：元）
     - percentile_real_flag: 是否真实历史分位（True=乐咕乐股20年数据，False=估算）
     - pe_pb_source: 数据来源（如 "乐咕乐股" / "估算（申万行业）"）
-    - data_quality: 数据质量标签（"REAL" / "ESTIMATED"）
+    - data_quality: 数据质量标签（"REAL" / "RELIABLE_EST" / "ESTIMATED"）
     - max_weight: 最大仓位（由 DataQualityFilter 设置）
     - score: 综合评分（由 PortfolioOptimizer 计算）
     - weight: 最终仓位（由 PortfolioOptimizer 分配）
@@ -79,7 +79,7 @@ class ETFData:
     # 可选字段（数据质量）
     percentile_real_flag: Optional[bool] = None
     pe_pb_source: Optional[str] = None
-    data_quality: Optional[str] = None  # "REAL" / "ESTIMATED"
+    data_quality: Optional[str] = None  # "REAL" / "RELIABLE_EST" / "ESTIMATED"
     
     # 新增字段（由后续模块填充）
     max_weight: Optional[float] = None  # 由 DataQualityFilter 设置
@@ -144,6 +144,7 @@ class RiskConfig:
     - total_position: 总仓位上限（0.0-1.0）
     - single_etf_cap: 单只 ETF 仓位上限（0.0-1.0）
     - real_data_cap: REAL 数据 ETF 合计仓位上限（0.0-1.0）
+    - reliable_est_data_cap: RELIABLE_EST 数据（申万行业加权）ETF 合计仓位上限
     - estimated_data_cap: ESTIMATED 数据 ETF 合计仓位上限（0.0-1.0）
     - correlation_threshold: 相关性阈值（0.0-1.0，高于此值视为高相关）
     - correlation_cap: 高相关 ETF 合计仓位上限（0.0-1.0）
@@ -154,6 +155,7 @@ class RiskConfig:
         ...     total_position=0.80,
         ...     single_etf_cap=0.20,
         ...     real_data_cap=0.40,
+        ...     reliable_est_data_cap=0.30,
         ...     estimated_data_cap=0.15
         ... )
     """
@@ -165,7 +167,12 @@ class RiskConfig:
     total_position: float = 0.80      # 总仓位上限（默认 80%）
     single_etf_cap: float = 0.20      # 单只 ETF 上限（默认 20%）
     real_data_cap: float = 0.40        # REAL 数据 ETF 合计上限（默认 40%）
+    reliable_est_data_cap: float = 0.30  # RELIABLE_EST 数据 ETF 合计上限（默认 30%）
     estimated_data_cap: float = 0.15    # ESTIMATED 数据 ETF 合计上限（默认 15%）
+    
+    # 行业/指数分散控制
+    industry_cap: float = 0.25         # 单一申万/穿透行业合计上限（默认 25%）
+    index_cap: float = 0.30            # 单一指数合计上限（默认 30%）
     
     # 相关性控制
     correlation_threshold: float = 0.70  # 相关性阈值（默认 0.70）
@@ -183,7 +190,10 @@ class RiskConfig:
             "total_position": self.total_position,
             "single_etf_cap": self.single_etf_cap,
             "real_data_cap": self.real_data_cap,
+            "reliable_est_data_cap": self.reliable_est_data_cap,
             "estimated_data_cap": self.estimated_data_cap,
+            "industry_cap": self.industry_cap,
+            "index_cap": self.index_cap,
             "correlation_threshold": self.correlation_threshold,
             "correlation_cap": self.correlation_cap
         }
@@ -199,6 +209,14 @@ class RiskConfig:
         Returns:
             RiskConfig: 风险配置对象
         """
+        # 兼容旧格式：缺的字段用默认值
+        defaults = {
+            "industry_cap": 0.25,
+            "index_cap": 0.30,
+        }
+        for k, v in defaults.items():
+            if k not in data:
+                data[k] = v
         return cls(**data)
 
 
@@ -237,13 +255,14 @@ class PortfolioItem:
     name: str
     weight: float
     reason: str
-    data_quality: str  # "REAL" / "ESTIMATED"
+    data_quality: str  # "REAL" / "RELIABLE_EST" / "ESTIMATED"
     
-    # 可选字段（用于生成 reason）
+    # 可选字段（用于生成 reason 和输出）
     pe_percentile: Optional[float] = None
     pb_percentile: Optional[float] = None
     avg_amount_20d: Optional[float] = None
     score: Optional[float] = None
+    max_weight: Optional[float] = None  # data_quality.py 设置的单只上限
     
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -261,7 +280,8 @@ class PortfolioItem:
             "pe_percentile": self.pe_percentile,
             "pb_percentile": self.pb_percentile,
             "avg_amount_20d": self.avg_amount_20d,
-            "score": self.score
+            "score": self.score,
+            "max_weight": self.max_weight
         }
     
     @classmethod
@@ -472,9 +492,15 @@ def create_etf_data_from_dict(data: Dict[str, Any]) -> ETFData:
     # 创建对象
     etf = ETFData(**kwargs)
     
-    # 设置 data_quality（如果未设置）
-    if etf.data_quality is None and etf.percentile_real_flag is not None:
-        etf.data_quality = "REAL" if etf.percentile_real_flag else "ESTIMATED"
+    # 设置 data_quality（如果未设置或无效）
+    if not etf.data_quality or str(etf.data_quality).upper() == "N/A":
+        # 三档分类
+        if etf.percentile_real_flag:
+            etf.data_quality = "REAL"
+        elif etf.pe_pb_source and '申万' in etf.pe_pb_source:
+            etf.data_quality = "RELIABLE_EST"
+        else:
+            etf.data_quality = "ESTIMATED"
     
     return etf
 
@@ -503,7 +529,10 @@ def create_risk_config(risk_level: str) -> RiskConfig:
             "total_position": 0.50,      # 总仓位 ≤ 50%
             "single_etf_cap": 0.10,       # 单只 ETF ≤ 10%
             "real_data_cap": 0.30,         # REAL 数据 ETF ≤ 30%
-            "estimated_data_cap": 0.10,    # ESTIMATED 数据 ETF ≤ 10%
+            "reliable_est_data_cap": 0.20,  # RELIABLE_EST 数据 ETF ≤ 20%
+            "estimated_data_cap": 0.05,    # ESTIMATED 数据 ETF ≤ 5%
+            "industry_cap": 0.15,           # 单一行业 ≤ 15%
+            "index_cap": 0.20,              # 单一指数 ≤ 20%
             "correlation_threshold": 0.70,
             "correlation_cap": 0.20
         },
@@ -512,7 +541,10 @@ def create_risk_config(risk_level: str) -> RiskConfig:
             "total_position": 0.80,         # 总仓位 ≤ 80%
             "single_etf_cap": 0.20,         # 单只 ETF ≤ 20%
             "real_data_cap": 0.40,          # REAL 数据 ETF ≤ 40%
-            "estimated_data_cap": 0.30,     # ESTIMATED 数据 ETF ≤ 30%
+            "reliable_est_data_cap": 0.80,   # RELIABLE_EST 数据 ETF ≤ 80%
+            "estimated_data_cap": 0.10,     # ESTIMATED 数据 ETF ≤ 10%
+            "industry_cap": 0.25,           # 单一行业 ≤ 25%
+            "index_cap": 0.30,              # 单一指数 ≤ 30%
             "correlation_threshold": 0.70,
             "correlation_cap": 0.30
         },
@@ -521,7 +553,10 @@ def create_risk_config(risk_level: str) -> RiskConfig:
             "total_position": 1.00,        # 总仓位 ≤ 100%
             "single_etf_cap": 0.30,        # 单只 ETF ≤ 30%
             "real_data_cap": 0.60,         # REAL 数据 ETF ≤ 60%
-            "estimated_data_cap": 0.20,     # ESTIMATED 数据 ETF ≤ 20%
+            "reliable_est_data_cap": 0.40,   # RELIABLE_EST 数据 ETF ≤ 40%
+            "estimated_data_cap": 0.15,     # ESTIMATED 数据 ETF ≤ 15%
+            "industry_cap": 0.35,           # 单一行业 ≤ 35%
+            "index_cap": 0.40,              # 单一指数 ≤ 40%
             "correlation_threshold": 0.70,
             "correlation_cap": 0.40
         }

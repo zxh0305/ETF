@@ -158,7 +158,8 @@ class OutputGenerator:
                 pe_percentile=etf.pe_percentile,
                 pb_percentile=etf.pb_percentile,
                 avg_amount_20d=etf.avg_amount_20d,
-                score=etf.score
+                score=etf.score,
+                max_weight=etf.max_weight  # 新增：data_quality.py 设置的单只上限
             )
             
             portfolio_items.append(item)
@@ -172,11 +173,12 @@ class OutputGenerator:
         logger.info("正在构建 meta 信息...")
         
         total_weight = sum([item.weight for item in portfolio_items])
-        cash_weight = 1.0 - total_weight
+        cash_weight = round(1.0 - total_weight, 4)
         
         meta = {
             "generate_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "risk_level": risk_config.risk_level,
+            "total_position": risk_config.total_position,  # 新增：目标总仓位
             "total_etfs": len(portfolio_items),
             "total_weight": total_weight,
             "cash_weight": cash_weight,
